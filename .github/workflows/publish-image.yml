@@ -6,7 +6,10 @@
 # policy lives in the infrastructure-v3 repo, at
 # gitops/<env>/platform/policy-controller/cluster-image-policy.yaml — MOVING
 # OR RENAMING THIS FILE CHANGES THE SIGNING IDENTITY AND BREAKS ADMISSION IN
-# BOTH CLUSTERS until that policy is updated first. See README.md.
+# BOTH CLUSTERS. To do it: add the new subject to that policy alongside the
+# old one, let both environments sync (prod tracks the mainnet-beta release
+# branch, so that is a second PR), re-release images through the new identity,
+# and only then drop the old entry. The other order rejects every image.
 #
 # Why this indirection exists: tag-push events run the CALLER's workflow file
 # from the tagged commit, so any in-caller gate can be stripped on a branch
