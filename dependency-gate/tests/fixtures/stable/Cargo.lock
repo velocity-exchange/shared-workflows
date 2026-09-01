@@ -1,0 +1,17 @@
+# Fixture for the dogfood jobs in .github/workflows/test.yml.
+#
+# This file must never change. Those jobs assert that the gate reports zero
+# findings for it, which is what proves the action runs clean in both trigger
+# modes. To exercise a non-zero finding, change tests/fixtures/Cargo.lock
+# instead: that is the one .github/workflows/dependency-gate.yml watches.
+version = 3
+
+[[package]]
+name = "stable-crate"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[package]]
+name = "stable-path-crate"
+version = "0.1.0"

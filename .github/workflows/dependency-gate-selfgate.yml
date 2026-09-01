@@ -1,0 +1,35 @@
+name: Dependency gate (self)
+
+# This repository gates itself the way a consumer would, so the failure path is
+# exercised for real rather than only in tests. tests/fixtures/Cargo.lock is the file
+# under watch: adding a package to it must make this job fail until the deps-reviewed
+# label is applied.
+#
+# pull_request_target runs this workflow from the base branch instead of from the pull
+# request. Under pull_request it is the pull request's own copy that runs, so a pull
+# request could empty the lockfiles input or make enforcement exit 0 in the same diff
+# that adds a package. The usual pull_request_target hazard does not apply, because the
+# pull request is never checked out: its lockfiles are read as bytes through the
+# contents API at a pinned head SHA and parsed by the base branch's parser.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  issues: write # label removal goes through the issues API
+  pull-requests: write
+
+jobs:
+  gate:
+    name: Dependency gate
+    runs-on: ubuntu-latest
+    steps:
+      # Checks out the base branch, which is what pull_request_target resolves to.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: ./dependency-gate
+        with:
+          lockfiles: dependency-gate/tests/fixtures/Cargo.lock
+          require-pull-request-target: "true"

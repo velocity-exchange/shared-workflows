@@ -1,0 +1,150 @@
+name: Dependency gate tests
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "dependency-gate/**"
+      - ".github/workflows/dependency-gate-test.yml"
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - "dependency-gate/**"
+      - ".github/workflows/dependency-gate-test.yml"
+  # Only the dogfood-prt job below uses this. Under pull_request_target the workflow,
+  # and `uses: ./`, both come from the base branch, so this exercises the base branch's
+  # action rather than the pull request's. That is the point of the mode.
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - "dependency-gate/**"
+      - ".github/workflows/dependency-gate-test.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  parser:
+    name: Parser tests
+    # Must run the pull request's own code, so not under pull_request_target.
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - run: python3 dependency-gate/tests/test_parser.py
+
+  action-yml:
+    name: action.yml is valid
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Parse action.yml and check the declared contract
+        run: |
+          python3 - <<'PY'
+          import re
+          import yaml
+          d = yaml.safe_load(open("dependency-gate/action.yml"))
+          assert d["runs"]["using"] == "composite", d["runs"]["using"]
+          assert "lockfiles" in d["inputs"], "lockfiles input missing"
+          assert d["inputs"]["lockfiles"]["required"] is True
+          assert set(d["outputs"]) == {"count", "digest", "findings"}, set(d["outputs"])
+          for step in d["runs"]["steps"]:
+              assert step.get("shell") == "bash", step.get("name")
+          # Every Actions expression must arrive through env:, never interpolated into
+          # a run: body, where a crafted value would be pasted straight into bash.
+          leaked = [
+              (step["name"], m)
+              for step in d["runs"]["steps"]
+              for m in re.findall(r"\$\{\{[^}]*\}\}", step.get("run") or "")
+          ]
+          assert not leaked, f"expressions interpolated into run bodies: {leaked}"
+          print(f'ok: {len(d["runs"]["steps"])} composite steps, no leaked expressions')
+          PY
+
+  shell:
+    name: Shellcheck the composite steps
+    if: github.event_name != 'pull_request_target'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: Extract each run block and shellcheck it
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib, re, yaml
+          d = yaml.safe_load(open("dependency-gate/action.yml"))
+          out = pathlib.Path("shell-blocks"); out.mkdir(exist_ok=True)
+          for i, step in enumerate(d["runs"]["steps"]):
+              script = step.get("run")
+              if not script:
+                  continue
+              # Actions expressions are substituted before bash sees them; replace
+              # them with a placeholder so shellcheck parses the real structure.
+              script = re.sub(r"\$\{\{[^}]*\}\}", "PLACEHOLDER", script)
+              (out / f"step{i}.sh").write_text("#!/usr/bin/env bash\n" + script)
+          PY
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # SC2086 is noisy here: $LOCKFILES is intentionally word-split.
+          shellcheck --severity=warning --exclude=SC2086 shell-blocks/*.sh
+
+  dogfood-pr:
+    name: Gate this repository with itself (pull_request mode)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - id: gate
+        uses: ./dependency-gate
+        with:
+          # The stable fixtures never change, so this job stays green. The gate's
+          # failure path is exercised by .github/workflows/dependency-gate.yml, which
+          # watches tests/fixtures/Cargo.lock.
+          lockfiles: dependency-gate/tests/fixtures/stable/Cargo.lock dependency-gate/tests/fixtures/stable/uv.lock
+          comment: "false"
+      - name: The stable fixtures are unchanged, so the count must be zero
+        env:
+          COUNT: ${{ steps.gate.outputs.count }}
+          DIGEST: ${{ steps.gate.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test "$COUNT" = "0" || { echo "expected count=0, got '$COUNT'"; exit 1; }
+          test -n "$DIGEST" || { echo "expected a digest to be reported"; exit 1; }
+          echo "ok: count=$COUNT digest=$DIGEST"
+
+  dogfood-prt:
+    name: Gate this repository with itself (pull_request_target mode)
+    if: github.event_name == 'pull_request_target'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      # Checks out the base branch, which is what pull_request_target resolves to. The
+      # pull request's own files are never checked out; the gate reads its lockfiles
+      # through the contents API at a pinned head SHA.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - id: gate
+        uses: ./dependency-gate
+        with:
+          lockfiles: dependency-gate/tests/fixtures/stable/Cargo.lock dependency-gate/tests/fixtures/stable/uv.lock
+          comment: "false"
+          require-pull-request-target: "true"
+      - name: The stable fixtures are unchanged, so the count must be zero
+        env:
+          COUNT: ${{ steps.gate.outputs.count }}
+          DIGEST: ${{ steps.gate.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test "$COUNT" = "0" || { echo "expected count=0, got '$COUNT'"; exit 1; }
+          test -n "$DIGEST" || { echo "expected a digest to be reported"; exit 1; }
+          echo "ok: count=$COUNT digest=$DIGEST"
