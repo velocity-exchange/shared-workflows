@@ -2,54 +2,58 @@
 
 Reusable GitHub Actions workflows shared across `velocity-exchange` repos.
 
-| workflow | what it does |
-| --- | --- |
-| [`publish-image.yml`](.github/workflows/publish-image.yml) | The central image publisher. Builds, pushes to non-prod ECR, copies to prod by digest, and cosign-signs both. |
-| [`secret-scan-reusable.yml`](.github/workflows/secret-scan-reusable.yml) | TruffleHog scan of a pull request's own commits. |
+## `publish-image.yml`
 
-## Why this repo is public
+The central image publisher. Builds an image, pushes it to the non-prod ECR,
+copies it to prod by digest, and cosign-signs it in both registries.
 
-A **public** repository cannot consume a reusable workflow from a **private**
-one, and the org is on the GitHub Team plan, so `internal` visibility does not
-exist. With repos on both sides of that line, a public host is the only
-arrangement that works for every caller.
-
-Nothing sensitive lives here. Role ARNs come from repository/org `vars`,
-registries are resolved at runtime, and build secrets are passed in by the
-caller via `secrets:`. Publishing the *logic* is fine; what matters is who can
-change it — see below.
-
-## ⚠️ This repo is a trust root
-
-`publish-image.yml` is the single workflow identity the Kubernetes admission
-policy trusts. For a reusable workflow the cosign keyless certificate identity
-is the `job_workflow_ref` — this file's path at its ref — and the
-ClusterImagePolicy pins exactly:
-
-```
-https://github.com/velocity-exchange/shared-workflows/.github/workflows/publish-image.yml@refs/heads/master
-```
-
-Two consequences:
-
-1. **Whoever can merge to `master` here controls what reaches prod ECR.**
-   Branch protection and CODEOWNERS on this repo are load-bearing, not
-   hygiene. The security argument in `publish-image.yml` is literally "`@master`,
-   whose content is protected by this repo's branch rules".
-2. **Moving, renaming or re-reffing that file breaks image admission in both
-   clusters** until the policy is updated. The policy lives in the
-   `infrastructure-v3` repo at
-   `gitops/<env>/platform/policy-controller/cluster-image-policy.yaml`.
-
-To change the publisher's path or ref, use the dual-identity sequence: add the
-new subject to the policy alongside the old one, let both environments sync
-(prod tracks the `mainnet-beta` release branch, so that is a second PR),
-re-release images through the new identity, and only then drop the old entry.
-Doing it in the other order rejects every image.
-
-## Usage
+Runs on release tags. It fails the build unless the tagged commit is already on
+the calling repo's `master`, so releases can only be cut from reviewed code.
+AWS access is via OIDC; role ARNs come from the caller's
+`VELOCITY_NON_PROD_ECR_PUBLISH_ROLE` / `VELOCITY_PROD_ECR_PUBLISH_ROLE` repo or
+org variables.
 
 ```yaml
+jobs:
+  publish:
+    uses: velocity-exchange/shared-workflows/.github/workflows/publish-image.yml@master
+    with:
+      ecr_repository: my-service
+      image_tag: ${{ github.ref_name }}
+```
+
+| input | required | default | notes |
+| --- | --- | --- | --- |
+| `ecr_repository` | yes | — | ECR repo name; the same in both registries |
+| `image_tag` | yes | — | e.g. `v1.2.3` |
+| `dockerfile` | no | `Dockerfile` | |
+| `context` | no | `.` | Docker build context |
+| `build_args` | no | — | Newline-separated `KEY=value` |
+| `cache_scope` | no | — | gha cache scope; empty disables the cache |
+| `checkout_submodules` | no | `false` | `false`, `true` or `recursive` |
+| `runner` | no | — | Runner label for the build |
+
+Secrets: `build_secrets`, newline-separated `id=value` docker build secrets.
+
+## `secret-scan-reusable.yml`
+
+Scans a pull request's own commits (`merge-base..head`) with TruffleHog.
+
+| tier | behaviour |
+| --- | --- |
+| verified — replayed against the issuing provider and it authenticated | fails the job |
+| unknown — matched, but verification could not conclude | annotates |
+| possible Solana keypair — a 64-byte array | annotates |
+
+Findings report the detector and `file:line` only, never the matched value.
+
+```yaml
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
 jobs:
   secret-scan:
     uses: velocity-exchange/shared-workflows/.github/workflows/secret-scan-reusable.yml@master
@@ -57,7 +61,10 @@ jobs:
       runner: ubicloud
 ```
 
-Pin `publish-image.yml` to a tag rather than a moving ref where you can: a
-change there lands in every consumer's build pipeline at once. The secret scan
-is deliberately the opposite — a moving ref, so detector fixes reach all repos
-immediately.
+| input | required | default | notes |
+| --- | --- | --- | --- |
+| `runner` | no | `ubicloud-standard-8` | Most repos want `ubicloud` |
+| `fail_on_verified` | no | `true` | `false` makes the job annotate-only |
+
+Callers must be triggered by `pull_request`; the workflow fails fast under any
+other trigger.
