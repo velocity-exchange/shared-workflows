@@ -35,6 +35,55 @@ jobs:
 
 Secrets: `build_secrets`, newline-separated `id=value` docker build secrets.
 
+## `dependency-gate/`
+
+A composite action, not a reusable workflow — used as a step. It flags the
+dependencies a pull request newly introduces, and existing ones it repoints at a
+new source, then requires a `deps-reviewed` label before the PR can merge. The
+sign-off is bound to the exact set of findings it was shown, so adding another
+dependency afterwards re-opens the gate.
+
+Version bumps within the same source stay quiet; only new packages and changed
+origins are reported. Supports `bun.lock`, `yarn.lock`, `pnpm-lock.yaml`,
+`Cargo.lock` and `uv.lock`.
+
+The parser lives here rather than in the repo being gated, so a pull request
+cannot weaken the check that is inspecting it. Callers run it under
+`pull_request_target` and pass `require-pull-request-target: true`, which makes
+the action fail loudly if that is ever downgraded.
+
+```yaml
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  new-dependency-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: velocity-exchange/shared-workflows/dependency-gate@<sha>
+        with:
+          lockfiles: yarn.lock apps/foo/Cargo.lock
+          require-pull-request-target: true
+```
+
+| input | required | default | notes |
+| --- | --- | --- | --- |
+| `lockfiles` | yes | — | Space-separated, repo-relative lockfile paths |
+| `label` | no | `deps-reviewed` | Label recording human sign-off |
+| `comment` | no | `true` | Post/update a sticky comment listing findings |
+| `require-pull-request-target` | no | `false` | Fail if not run under `pull_request_target` |
+
+Outputs: `count`, `digest`, `findings`.
+
 ## `secret-scan-reusable.yml`
 
 Scans a pull request's own commits (`merge-base..head`) with TruffleHog.

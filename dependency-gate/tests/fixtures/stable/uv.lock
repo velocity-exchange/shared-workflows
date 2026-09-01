@@ -1,0 +1,24 @@
+# Fixture for the dogfood jobs in .github/workflows/test.yml. Must never change.
+# Present so those jobs exercise the multi-lockfile loop and the uv.lock parser,
+# whose source lives in an inline table rather than a plain string.
+version = 1
+revision = 2
+requires-python = ">=3.10"
+
+[[package]]
+name = "stable-project"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "stable-dep" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "stable-dep", specifier = ">=1.0" },
+]
+
+[[package]]
+name = "stable-dep"
+version = "1.0.0"
+source = { registry = "https://pypi.org/simple" }
