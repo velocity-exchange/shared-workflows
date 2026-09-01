@@ -1,0 +1,182 @@
+# THE central image publisher — the single workflow identity the admission
+# policy trusts. Every publishing repo calls this via
+#   uses: velocity-exchange/shared-workflows/.github/workflows/publish-image.yml@master
+# so the cosign keyless certificate's job_workflow_ref is THIS FILE AT
+# refs/heads/master, and the ClusterImagePolicy pins to exactly that. That
+# policy lives in the infrastructure-v3 repo, at
+# gitops/<env>/platform/policy-controller/cluster-image-policy.yaml — MOVING
+# OR RENAMING THIS FILE CHANGES THE SIGNING IDENTITY AND BREAKS ADMISSION IN
+# BOTH CLUSTERS until that policy is updated first. See README.md.
+#
+# Why this indirection exists: tag-push events run the CALLER's workflow file
+# from the tagged commit, so any in-caller gate can be stripped on a branch
+# and re-tagged. A branch-modified caller still ends up here — @master, whose
+# content is protected by this repo's branch rules — and the gate below
+# rejects any tagged commit that isn't on the caller repo's master. Stripping
+# the reusable call instead changes the certificate identity, which the
+# admission policy then rejects. Either way, unreviewed code can't acquire a
+# trusted signature.
+#
+# Signing is DIGEST-END-TO-END: the prod copy sources the non-prod image by
+# the built digest (never a mutable tag — TOCTOU) and both registries'
+# signatures sign that same digest. cosign is pinned to v2: v3 writes the new
+# bundle format the policy-controller verifier can't see. provenance: false
+# everywhere: attestation-bearing OCI indexes are what ECR 400s on during
+# copies (vamm-crank's corrupted prod v0.2.2/v0.2.4).
+name: Publish image (reusable)
+
+on:
+    workflow_call:
+        inputs:
+            ecr_repository:
+                description: ECR repo name (same in both registries)
+                required: true
+                type: string
+            image_tag:
+                description: Image tag to publish, e.g. v1.2.3 (or v1.2.3-bun)
+                required: true
+                type: string
+            dockerfile:
+                description: Path to the Dockerfile
+                required: false
+                type: string
+                default: Dockerfile
+            context:
+                description: Docker build context
+                required: false
+                type: string
+                default: .
+            build_args:
+                description: Newline-separated KEY=value build args
+                required: false
+                type: string
+                default: ''
+            cache_scope:
+                description: gha cache scope; empty disables the build cache
+                required: false
+                type: string
+                default: ''
+            checkout_submodules:
+                description: actions/checkout submodules value ('false', 'true' or 'recursive')
+                required: false
+                type: string
+                default: 'false'
+            runner:
+                description: Runner label for the build
+                required: false
+                type: string
+                default: ubicloud
+        secrets:
+            build_secrets:
+                description: Newline-separated id=value docker build secrets
+                required: false
+
+jobs:
+    publish:
+        runs-on: ${{ inputs.runner }}
+        steps:
+            # Release tags must point at reviewed code: fail unless the tagged
+            # commit is already on the CALLER repo's master. Runs here — not in
+            # the caller — so it can't be stripped by editing a branch's
+            # workflow file. Uses the compare API; no git history needed.
+            - name: Require tagged commit to be on master
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  set -euo pipefail
+                  status=$(curl -sf -H "Authorization: Bearer ${GH_TOKEN}" \
+                    -H "Accept: application/vnd.github+json" \
+                    "https://api.github.com/repos/${GITHUB_REPOSITORY}/compare/master...${GITHUB_SHA}" | jq -r '.status')
+                  if [ "$status" != "identical" ] && [ "$status" != "behind" ]; then
+                    echo "::error::${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on master (compare status: ${status}). Release tags must point at reviewed master commits."
+                    exit 1
+                  fi
+
+            - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+              with:
+                  submodules: ${{ inputs.checkout_submodules }}
+
+            - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+              with:
+                  cosign-release: 'v2.6.5'
+
+            - name: Configure AWS credentials (non-prod)
+              uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
+              with:
+                  role-to-assume: ${{ vars.VELOCITY_NON_PROD_ECR_PUBLISH_ROLE }}
+                  role-session-name: gha-${{ github.run_id }}
+                  aws-region: eu-west-1
+
+            - name: Log in to Amazon ECR (non-prod)
+              id: login-ecr
+              uses: aws-actions/amazon-ecr-login@19d944daaa35f0fa1d3f7f8af1d3f2e5de25c5b7 # v2.1.4
+
+            - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+            - name: Build and push (non-prod)
+              id: build
+              uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+              with:
+                  context: ${{ inputs.context }}
+                  file: ${{ inputs.dockerfile }}
+                  push: true
+                  provenance: false
+                  tags: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}:${{ inputs.image_tag }}
+                  build-args: ${{ inputs.build_args }}
+                  cache-from: ${{ inputs.cache_scope != '' && format('type=gha,scope={0}', inputs.cache_scope) || '' }}
+                  cache-to: ${{ inputs.cache_scope != '' && format('type=gha,mode=max,scope={0}', inputs.cache_scope) || '' }}
+                  secrets: ${{ secrets.build_secrets }}
+
+            - name: Sign image (non-prod)
+              env:
+                  REF: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}
+                  TAG: ${{ inputs.image_tag }}
+                  DIGEST: ${{ steps.build.outputs.digest }}
+              run: |
+                  set -euo pipefail
+                  cosign sign --yes "${REF}@${DIGEST}"
+                  echo "Signed \`${TAG}\` — gitops pin: \`${REF}:${TAG}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Configure AWS credentials (prod)
+              if: vars.VELOCITY_PROD_ECR_PUBLISH_ROLE != ''
+              uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
+              with:
+                  role-to-assume: ${{ vars.VELOCITY_PROD_ECR_PUBLISH_ROLE }}
+                  role-session-name: gha-${{ github.run_id }}
+                  aws-region: eu-west-1
+
+            - name: Log in to Amazon ECR (prod)
+              if: vars.VELOCITY_PROD_ECR_PUBLISH_ROLE != ''
+              id: login-ecr-prod
+              uses: aws-actions/amazon-ecr-login@19d944daaa35f0fa1d3f7f8af1d3f2e5de25c5b7 # v2.1.4
+
+            - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+              if: vars.VELOCITY_PROD_ECR_PUBLISH_ROLE != ''
+
+            # Copy BY THE BUILT DIGEST with crane — a pure registry-to-registry
+            # copy that CANNOT rewrite the manifest, so the prod tag points at
+            # exactly the (signed) manifest this run built. `imagetools create`
+            # is not a copy: it re-created the index even from a single digest
+            # source, leaving the prod tag on an UNSIGNED digest (2026-08-20,
+            # vamm v0.2.5 / ikb v0.1.24 / usermap v0.1.12). The assertion makes
+            # any future tool regression fail the run instead of silently
+            # publishing an unsigned prod tag.
+            - name: Copy image to prod ECR (digest-preserving)
+              if: vars.VELOCITY_PROD_ECR_PUBLISH_ROLE != ''
+              env:
+                  SRC: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}
+                  DST: ${{ steps.login-ecr-prod.outputs.registry }}/${{ inputs.ecr_repository }}
+                  TAG: ${{ inputs.image_tag }}
+                  DIGEST: ${{ steps.build.outputs.digest }}
+              run: |
+                  set -euo pipefail
+                  crane copy "${SRC}@${DIGEST}" "${DST}:${TAG}"
+                  prod_digest=$(crane digest "${DST}:${TAG}")
+                  if [ "$prod_digest" != "$DIGEST" ]; then
+                    echo "::error::prod tag ${TAG} points at ${prod_digest}, expected built digest ${DIGEST} — copy did not preserve the digest."
+                    exit 1
+                  fi
+
+            - name: Sign image (prod)
+              if: vars.VELOCITY_PROD_ECR_PUBLISH_ROLE != ''
+              run: cosign sign --yes "${{ steps.login-ecr-prod.outputs.registry }}/${{ inputs.ecr_repository }}@${{ steps.build.outputs.digest }}"

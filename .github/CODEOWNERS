@@ -1,0 +1,13 @@
+# Every change requires review from one of the reviewers below.
+# Ordering rule: the last matching pattern wins.
+#
+# This repo is a TRUST ROOT, not ordinary shared config - see README.md.
+# publish-image.yml is listed separately from `*` on purpose: it is the single
+# workflow identity the ClusterImagePolicy trusts, so whoever can merge it
+# controls what reaches prod ECR. It currently carries the same reviewer set as
+# everything else; narrowing that one line to a release-approver subset is a
+# one-line change and is worth doing.
+
+*	@0xahzam @ChewingGlass @jt-lumen @ChesterSim @csadminlc @noah-velocity-admin @jtadminlc
+
+/.github/workflows/publish-image.yml	@0xahzam @ChewingGlass @jt-lumen @ChesterSim @csadminlc @noah-velocity-admin @jtadminlc
