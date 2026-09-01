@@ -1,0 +1,421 @@
+name: Dependency gate
+description: >
+  Flag the dependencies a pull request newly introduces, and the existing ones it
+  repoints at a new source, then require an explicit human sign-off label before it
+  can merge. Sign-off is bound to the exact set of findings it was given for.
+author: velocity-exchange
+
+branding:
+  icon: package
+  color: green
+
+inputs:
+  lockfiles:
+    description: >
+      Space-separated, repo-relative lockfile paths to watch. Supported names:
+      bun.lock, yarn.lock, pnpm-lock.yaml, Cargo.lock, uv.lock.
+    required: true
+  label:
+    description: Label that records human sign-off on the reported findings.
+    required: false
+    default: deps-reviewed
+  comment:
+    description: Post or update a sticky comment listing the findings.
+    required: false
+    default: "true"
+  comment-author:
+    description: >
+      Login that must have authored a comment for the sign-off marker inside it to be
+      honoured. Change this only if `token` is not the default GITHUB_TOKEN, because
+      the marker is then written under that token's own identity.
+    required: false
+    default: github-actions[bot]
+  require-pull-request-target:
+    description: >
+      Fail the run unless it was triggered by `pull_request_target`. Set this once the
+      workflow exists on the base branch, so nobody can quietly downgrade the trigger.
+    required: false
+    default: "false"
+  token:
+    description: Token used to read the pull request and write the sticky comment.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  count:
+    description: Number of findings.
+    value: ${{ steps.collect.outputs.count }}
+  digest:
+    description: Digest of the finding set that sign-off is bound to.
+    value: ${{ steps.collect.outputs.digest }}
+  findings:
+    description: >
+      Tab-separated "lockfile<TAB>change<TAB>name<TAB>source" lines, where change is
+      `new` or `source`.
+    value: ${{ steps.collect.outputs.findings }}
+
+runs:
+  using: composite
+  steps:
+    # The parser lives inside this action rather than in the calling repository, so a
+    # pull request cannot weaken the check that is inspecting it.
+    - name: Work out the trigger mode and the base revision
+      id: resolve
+      shell: bash
+      env:
+        EVENT: ${{ github.event_name }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PUSH_BEFORE: ${{ github.event.before }}
+        REQUIRE_PRT: ${{ inputs.require-pull-request-target }}
+      run: |
+        set -euo pipefail
+        resolve() { git rev-parse --verify --quiet "$1^{commit}"; }
+
+        # prt: the workflow comes from the base branch and the pull request's files are
+        #      never checked out. This is the mode to run in.
+        # pr:  the workflow is the pull request's own copy, so it can be edited in the
+        #      same diff it is meant to gate. Supported because a pull request that
+        #      *introduces* the gate cannot run under pull_request_target at all.
+        # other: a push or anything else. Reported, never enforced.
+        case "$EVENT" in
+          pull_request_target) mode="prt" ;;
+          pull_request)        mode="pr" ;;
+          *)                   mode="other" ;;
+        esac
+        echo "mode=$mode" >> "$GITHUB_OUTPUT"
+
+        if [ "$REQUIRE_PRT" = "true" ] && [ "$mode" != "prt" ]; then
+          echo "::error::require-pull-request-target is set, but this run was triggered by '$EVENT'."
+          exit 1
+        fi
+
+        if [ "$mode" = "pr" ]; then
+          echo "::warning::Triggered by 'pull_request', so this workflow file is the pull request's own copy and the pull request can edit or delete its own gate. Switch the trigger to 'pull_request_target' once this workflow exists on the base branch."
+        fi
+
+        if [ "$mode" = "prt" ]; then
+          if ! [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Expected a 40-character head SHA in the event payload, got '$HEAD_SHA'."
+            exit 1
+          fi
+        fi
+
+        base=""
+        case "$mode" in
+          prt)
+            # Every candidate here is base-branch content. The last one is the tip of
+            # the base branch, which is what actions/checkout leaves in the tree under
+            # pull_request_target, so a default shallow checkout still works.
+            base=$(resolve "$BASE_SHA" || resolve "origin/$GITHUB_BASE_REF" || resolve HEAD || true)
+            ;;
+          pr)
+            # Not HEAD here: under pull_request that is the merge commit, which
+            # contains the pull request's own changes.
+            base=$(resolve "$BASE_SHA" || resolve "origin/$GITHUB_BASE_REF" || true)
+            ;;
+          *)
+            if [ -n "${PUSH_BEFORE:-}" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+              base=$(resolve "$PUSH_BEFORE" || true)
+            fi
+            ;;
+        esac
+
+        if [ -z "$base" ]; then
+          if [ "$mode" != "other" ]; then
+            # On a pull request the base is always knowable, so this is a
+            # misconfiguration and must not pass quietly.
+            echo "::error::Could not resolve the base revision. Check out the repository before this action, with 'fetch-depth: 0' so the base commit is present."
+            exit 1
+          fi
+          # Elsewhere there may genuinely be no predecessor: a new branch, a first
+          # push, or a force push. Nothing to diff against, so skip.
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "No base revision to compare against; skipping."
+          exit 0
+        fi
+        echo "base=$base" >> "$GITHUB_OUTPUT"
+        echo "Mode $mode, comparing against $base"
+
+    - name: Collect new packages and changed sources
+      id: collect
+      if: steps.resolve.outputs.skip != 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        LOCKFILES: ${{ inputs.lockfiles }}
+        MODE: ${{ steps.resolve.outputs.mode }}
+        BASE: ${{ steps.resolve.outputs.base }}
+      run: |
+        set -euo pipefail
+        parser="$GITHUB_ACTION_PATH/lockfile_packages.py"
+        work=$(mktemp -d)
+        : > "$work/findings.tsv"
+
+        if [ "$MODE" = "prt" ]; then
+          # One authoritative listing of the head tree. A "Not Found" on an individual
+          # file cannot be used to skip it: a wrong SHA, a revoked token and a genuinely
+          # absent path all look alike, and reading any of them as "nothing was added"
+          # would open the gate. So existence is decided here, once, and anything wrong
+          # with this listing fails the job.
+          if ! gh api "repos/$REPO/git/trees/$HEAD_SHA?recursive=1" > "$work/tree.json"; then
+            echo "::error::Could not list the head tree at $HEAD_SHA. The token needs 'contents: read', and the head commit must be reachable from this repository. Refusing to continue, because an unreadable listing must not be read as 'nothing was added'."
+            exit 1
+          fi
+          if [ "$(jq -r '.truncated' "$work/tree.json")" != "false" ]; then
+            echo "::error::The head tree listing was truncated, so which lockfiles exist cannot be established."
+            exit 1
+          fi
+          jq -r '.tree[] | select(.type == "blob") | .path' "$work/tree.json" > "$work/head-paths.txt"
+        fi
+
+        seen=0
+        for lock in $LOCKFILES; do
+          case "$lock" in
+            -*|/*|*..*)
+              echo "::error::Refusing the lockfile path '$lock': it must be repo-relative and must not escape the repository."
+              exit 1 ;;
+          esac
+
+          head_copy=""
+          if [ "$MODE" = "prt" ]; then
+            if grep -qxF "$lock" "$work/head-paths.txt"; then
+              mkdir -p "$work/head/$(dirname "$lock")"
+              # Read as bytes at a pinned SHA. None of the pull request's commits enter
+              # the checkout, so there is nothing of the pull request's to execute.
+              # The tree listing above already said this path exists, so a failure here
+              # is a real problem and never an absent file.
+              if ! gh api "repos/$REPO/contents/$lock?ref=$HEAD_SHA" \
+                  -H "Accept: application/vnd.github.raw" > "$work/head/$lock"; then
+                echo "::error::Could not read '$lock' at $HEAD_SHA even though the head tree lists it. Refusing to treat that as 'nothing was added'."
+                exit 1
+              fi
+              head_copy="$work/head/$lock"
+            fi
+          elif [ -f "$lock" ]; then
+            head_copy="$lock"
+          fi
+
+          # The parser treats a path that does not exist as "added by this change, so
+          # everything in it is new". An empty file is not the same thing and would be a
+          # parse error, so remove the file git show may have half-written.
+          mkdir -p "$work/base/$(dirname "$lock")"
+          git show "$BASE:$lock" > "$work/base/$lock" 2>/dev/null || rm -f "$work/base/$lock"
+
+          if [ -z "$head_copy" ] && [ ! -f "$work/base/$lock" ]; then
+            echo "::warning::Watched lockfile '$lock' exists at neither the base nor the head; skipping."
+            continue
+          fi
+          seen=$((seen + 1))
+          if [ -z "$head_copy" ]; then
+            echo "::warning::Watched lockfile '$lock' is deleted by this change; nothing to compare."
+            continue
+          fi
+
+          # Package names travel by file, never on a command line, so ENVIRON is used
+          # rather than an -v assignment, which would interpret backslash escapes.
+          python3 "$parser" "$work/base/$lock" "$head_copy" \
+            | LOCK="$lock" awk '{ print ENVIRON["LOCK"] "\t" $0 }' >> "$work/findings.tsv"
+        done
+
+        if [ "$seen" -eq 0 ]; then
+          echo "::error::None of the watched lockfiles exist at the base or the head. Check the 'lockfiles' input."
+          exit 1
+        fi
+
+        count=$(wc -l < "$work/findings.tsv" | tr -d ' ')
+        # Sign-off is bound to this digest, so adding to the finding set later
+        # invalidates it. Computed by the parser so ordering and locale cannot affect it.
+        digest=$(python3 "$parser" --digest "$work/findings.tsv")
+
+        echo "count=$count" >> "$GITHUB_OUTPUT"
+        echo "digest=$digest" >> "$GITHUB_OUTPUT"
+        echo "tsv=$work/findings.tsv" >> "$GITHUB_OUTPUT"
+        # Every finding line contains three tab characters, so no finding can ever be
+        # mistaken for this delimiter.
+        {
+          echo "findings<<__FINDINGS_EOF__"
+          cat "$work/findings.tsv"
+          echo "__FINDINGS_EOF__"
+        } >> "$GITHUB_OUTPUT"
+        echo "Findings: $count (digest $digest)"
+        cat "$work/findings.tsv"
+
+    - name: Read the sign-off recorded in the gate's own comment
+      id: signoff
+      if: steps.resolve.outputs.skip != 'true' && steps.resolve.outputs.mode != 'other'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        AUTHOR: ${{ inputs.comment-author }}
+        MARKER: "<!-- velocity-dependency-gate -->"
+      run: |
+        set -euo pipefail
+        # Only comments the gate itself wrote can carry sign-off. Anyone able to comment
+        # on the pull request could otherwise paste the marker and forge one.
+        if ! [[ "$AUTHOR" =~ ^[A-Za-z0-9._-]+(\[bot\])?$ ]]; then
+          echo "::error::comment-author '$AUTHOR' is not a plausible login."
+          exit 1
+        fi
+
+        work=$(mktemp -d)
+        : > "$work/comments.ndjson"
+        # One object per line across every page, so the newest matching comment in the
+        # whole thread is found rather than the newest on some single page.
+        gh api --paginate "repos/$REPO/issues/$PR/comments" --jq '.[]' \
+          > "$work/comments.ndjson" 2>/dev/null \
+          || echo "::warning::Could not read the pull request comments; treating sign-off as unrecorded."
+
+        # --arg, so neither the login nor the marker is ever interpolated into the filter.
+        row=$(jq -rs --arg author "$AUTHOR" --arg marker "$MARKER" '
+                [ .[]
+                  | select(.user.login == $author)
+                  | select((.body // "") | contains($marker))
+                ] | last
+                | if . == null then "\t"
+                  else "\(.id)\t\((([ (.body // "") | scan("<!-- gate-approved: ([0-9a-f]+) -->") ]
+                        | flatten | first) // ""))"
+                  end' "$work/comments.ndjson")
+
+        id=${row%%$'\t'*}
+        approved=${row#*$'\t'}
+        [[ "$id" =~ ^[0-9]*$ ]] || id=""
+        [[ "$approved" =~ ^[0-9a-f]*$ ]] || approved=""
+        echo "id=$id" >> "$GITHUB_OUTPUT"
+        echo "approved=$approved" >> "$GITHUB_OUTPUT"
+        echo "Gate comment: ${id:-none}, recorded sign-off: ${approved:-none}"
+
+    - name: Report and enforce
+      if: steps.resolve.outputs.skip != 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
+        PR: ${{ github.event.pull_request.number }}
+        MODE: ${{ steps.resolve.outputs.mode }}
+        COUNT: ${{ steps.collect.outputs.count }}
+        DIGEST: ${{ steps.collect.outputs.digest }}
+        TSV: ${{ steps.collect.outputs.tsv }}
+        COMMENT_ID: ${{ steps.signoff.outputs.id }}
+        APPROVED_DIGEST: ${{ steps.signoff.outputs.approved }}
+        LABEL: ${{ inputs.label }}
+        WANT_COMMENT: ${{ inputs.comment }}
+        EVENT_ACTION: ${{ github.event.action }}
+        LABEL_CHANGED: ${{ github.event.label.name }}
+        LABELS_JSON: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        MARKER: "<!-- velocity-dependency-gate -->"
+      run: |
+        set -euo pipefail
+
+        label_present=false
+        approved=false
+
+        if [ "$MODE" != "other" ] && [ "$COUNT" -gt 0 ]; then
+          # The event payload's label list is a snapshot from when the run started, so
+          # ask the API. Falling back to the payload beats treating a failed read as
+          # "no label", which would make the gate unsatisfiable.
+          labels=$(gh api --paginate "repos/$REPO/issues/$PR/labels" --jq '.[].name' 2>/dev/null) || {
+            echo "::warning::Could not read labels from the API; falling back to the event payload."
+            labels=$(printf '%s' "$LABELS_JSON" | jq -r '.[]?')
+          }
+          if printf '%s\n' "$labels" | grep -Fxq "$LABEL"; then
+            label_present=true
+          fi
+        fi
+
+        if [ "$label_present" = true ]; then
+          if [ "$EVENT_ACTION" = "labeled" ] && [ "$LABEL_CHANGED" = "$LABEL" ]; then
+            # Applied by the event that triggered this run, so it signs off the findings
+            # this run has just computed.
+            approved=true
+          elif [ -n "$APPROVED_DIGEST" ] && [ "$APPROVED_DIGEST" = "$DIGEST" ]; then
+            approved=true
+          else
+            # The label was applied for a different set of findings. Drop it, so the
+            # current set gets reviewed instead of inheriting the earlier sign-off.
+            echo "::warning::'$LABEL' was applied for a different set of findings; review the current set and apply it again."
+            label_path=$(jq -rn --arg name "$LABEL" '$name|@uri')
+            gh api --method DELETE "repos/$REPO/issues/$PR/labels/$label_path" --silent \
+              || echo "::warning::Could not remove the stale '$LABEL' label. It does not grant sign-off either way."
+          fi
+        fi
+
+        # Package names and sources reach markdown only through this file, and are HTML
+        # escaped on the way, so a crafted name cannot break out of its table cell or
+        # forge the approval marker above.
+        body=$(mktemp)
+        {
+          echo "$MARKER"
+          if [ "$approved" = true ]; then
+            echo "<!-- gate-approved: $DIGEST -->"
+          fi
+          if [ "$COUNT" -eq 0 ]; then
+            echo "### No new dependencies"
+            echo
+            echo "Every package in the watched lockfiles was already on the base branch, from the same source."
+          else
+            echo "### New dependencies in this pull request"
+            echo
+            echo "This pull request adds packages, or changes where existing packages are"
+            echo "fetched from. Confirm each one's **source, maintainer and integrity**, then"
+            echo "apply the \`$LABEL\` label to merge."
+            echo
+            echo '| Lockfile | Change | Package | Source |'
+            echo '| --- | --- | --- | --- |'
+            awk -F'\t' '
+              function esc(s) {
+                gsub(/&/, "\\&amp;", s); gsub(/</, "\\&lt;", s); gsub(/>/, "\\&gt;", s)
+                gsub(/\|/, "\\&#124;", s); gsub(/`/, "\\&#96;", s)
+                return s
+              }
+              { change = ($2 == "new") ? "new package" : "**source changed**"
+                print "| <code>" esc($1) "</code> | " change \
+                      " | <code>" esc($3) "</code> | <code>" esc($4) "</code> |" }
+            ' "$TSV"
+            echo
+            echo "Sign-off covers exactly this set (digest \`$DIGEST\`). Adding to it"
+            echo "afterwards drops the label and needs a fresh review."
+            if [ "$MODE" = "pr" ]; then
+              echo
+              echo "> Produced by a \`pull_request\` run, so this gate's own workflow came from"
+              echo "> the pull request. Prefer \`pull_request_target\`."
+            fi
+          fi
+        } > "$body"
+
+        cat "$body" >> "$GITHUB_STEP_SUMMARY"
+
+        # Outside a pull request there is nothing to label or comment on, so record the
+        # result and never fail the run.
+        if [ "$MODE" = "other" ]; then
+          echo "Not a pull request; reported to the job summary only."
+          exit 0
+        fi
+
+        if [ "$WANT_COMMENT" = "true" ] && { [ "$COUNT" -gt 0 ] || [ -n "$COMMENT_ID" ]; }; then
+          # A pull request from a fork gets a read-only token, so commenting can fail.
+          # That must not stop the enforcement below from running.
+          if [ -n "$COMMENT_ID" ]; then
+            gh api --method PATCH "repos/$REPO/issues/comments/$COMMENT_ID" -F body=@"$body" --silent \
+              || echo "::warning::Could not update the gate comment; still enforcing."
+          else
+            gh api --method POST "repos/$REPO/issues/$PR/comments" -F body=@"$body" --silent \
+              || echo "::warning::Could not post the gate comment; still enforcing."
+          fi
+        fi
+
+        if [ "$COUNT" -eq 0 ]; then
+          echo "No new dependencies and no changed sources."
+          exit 0
+        fi
+
+        if [ "$approved" = true ]; then
+          echo "::notice::$COUNT finding(s), signed off via the '$LABEL' label (digest $DIGEST)."
+        else
+          echo "::error::$COUNT finding(s) need review. Check each package's source, then apply the '$LABEL' label."
+          exit 1
+        fi

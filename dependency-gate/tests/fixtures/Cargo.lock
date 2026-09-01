@@ -1,0 +1,11 @@
+# Fixture for the dogfood job in .github/workflows/test.yml.
+# Not a real dependency set. Changing it changes that job's expected count.
+version = 3
+
+[[package]]
+name = "example-crate"
+version = "1.0.0"
+
+[[package]]
+name = "another-crate"
+version = "2.3.4"
