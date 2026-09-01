@@ -11,3 +11,7 @@
 *	@0xahzam @ChewingGlass @jt-lumen @ChesterSim @csadminlc @noah-velocity-admin @jtadminlc
 
 /.github/workflows/publish-image.yml	@0xahzam @ChewingGlass @jt-lumen @ChesterSim @csadminlc @noah-velocity-admin @jtadminlc
+
+# The dependency gate inspects the pull request that is changing it, so its
+# parser deliberately lives outside the repos it gates.
+/dependency-gate/	@0xahzam @ChewingGlass @jt-lumen @ChesterSim @csadminlc @noah-velocity-admin
