@@ -74,11 +74,17 @@ runs:
         set -euo pipefail
         resolve() { git rev-parse --verify --quiet "$1^{commit}"; }
 
-        # base.sha is the base branch *tip*, not the merge base. Diffing against the
-        # tip replays every base-branch commit made since the fork point, inverted:
-        # what the base branch dropped reads as something the pull request added. A
-        # branch that is merely behind then gets findings for packages it never
-        # touched.
+        # For prt only. base.sha is the base branch *tip*, not the merge base, and prt
+        # reads the head lockfiles at HEAD_SHA, a real commit off the pull request's
+        # branch. Diffing that against the tip replays every base-branch commit made
+        # since the fork point, inverted: what the base branch dropped reads as
+        # something the pull request added, so a branch that is merely behind gets
+        # findings for packages it never touched.
+        #
+        # pr is the other shape and wants the tip. There the head lockfiles come from
+        # the workspace, which is GitHub's merge commit, already carrying the base
+        # branch through base.sha; the merge base would blame the pull request for the
+        # base branch's own changes.
         #
         # The compare API answers this without the head commit being in the checkout,
         # which for a fork's head it never is: actions/checkout fetches refs/heads/*
@@ -89,8 +95,19 @@ runs:
           [ -n "${REPO:-}" ] || return 1
           [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || return 1
           [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || return 1
-          gh api "repos/$REPO/compare/$BASE_SHA...$HEAD_SHA" \
-            --jq '.merge_base_commit.sha' 2>/dev/null
+          local sha
+          if ! sha=$(gh api "repos/$REPO/compare/$BASE_SHA...$HEAD_SHA" \
+                       --jq '.merge_base_commit.sha' 2>/dev/null); then
+            # Not fatal, the candidates below still gate. Say so anyway: falling back
+            # to the tip resurrects the over-reporting, which changes the digest, which
+            # drops a sign-off label that was correctly applied.
+            echo "::warning::Could not reach the compare API to resolve the merge base; falling back to the base branch tip, which over-reports on a branch that is behind." >&2
+            return 1
+          fi
+          # gh writes its error body to stdout, and --jq yields "null" for a missing
+          # field, so the answer is checked the same way the inputs are.
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+          printf '%s\n' "$sha"
         }
 
         # prt: the workflow comes from the base branch and the pull request's files are
@@ -134,9 +151,10 @@ runs:
             ;;
           pr)
             # Not HEAD here: under pull_request that is the merge commit, which
-            # contains the pull request's own changes.
-            mb=$(merge_base || true)
-            base=$(resolve "${mb:-}" || resolve "$BASE_SHA" || resolve "origin/$GITHUB_BASE_REF" || true)
+            # contains the pull request's own changes. The tip, not the merge base:
+            # the collect step reads this mode's head lockfiles out of that merge
+            # commit, so the base branch is already on both sides of the comparison.
+            base=$(resolve "$BASE_SHA" || resolve "origin/$GITHUB_BASE_REF" || true)
             ;;
           *)
             if [ -n "${PUSH_BEFORE:-}" ] && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]; then

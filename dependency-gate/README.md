@@ -57,10 +57,8 @@ jobs:
           lockfiles: bun.lock ui/bun.lock
 ```
 
-`fetch-depth: 0` is required: the action compares against the **merge base** of the
-pull request and its target branch, which a shallow clone does not contain. The merge
-base, not the target branch's tip, is what keeps a branch that has fallen behind from
-being blamed for dependency changes that landed on the target branch after it forked.
+`fetch-depth: 0` is required: the action compares against the base commit, which a
+shallow clone does not contain.
 
 In this mode the action emits a `::warning::` on every run, because the workflow it is
 running from is the pull request's own copy. That is not paranoia, it is the residual
@@ -90,6 +88,13 @@ jobs:
 
 Set `require-pull-request-target: "true"` at the same time. It makes the action fail if
 it is ever triggered by anything else, so the trigger cannot be quietly downgraded.
+
+`fetch-depth: 0` is required here too, and for a second reason. In this mode the action
+compares against the **merge base** of the pull request and its target branch, not the
+target branch's tip, which is what keeps a branch that has fallen behind from being
+blamed for dependency changes that landed on the target branch after it forked. Step 1
+needs no such adjustment: `pull_request` hands the action GitHub's merge commit, which
+already carries the target branch, so there the tip is the correct comparison.
 
 **Why both modes exist.** Under `pull_request_target` the workflow is read from the base
 branch, so a pull request that *introduces* the gate does not run it at all: there is no
@@ -224,6 +229,11 @@ Known limits, stated rather than hidden:
 - `pnpm-lock.yaml` records no per-package registry in v9, so a registry swap made only in
   `.npmrc` is invisible here. Tarball and git overrides in a `resolution:` block *are*
   read.
+- A package the target branch has **removed** since the fork point, which this branch
+  still carries, is not reported. Comparing against the merge base is what makes the
+  gate agree with the three-dot diff a reviewer reads, and the target branch's removal
+  wins on merge anyway, unless the two sides edited the same lockfile hunks, in which
+  case the merge conflicts and the author resolves it by hand.
 
 ## Supported lockfiles
 
