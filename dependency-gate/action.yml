@@ -68,9 +68,47 @@ runs:
         HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         PUSH_BEFORE: ${{ github.event.before }}
         REQUIRE_PRT: ${{ inputs.require-pull-request-target }}
+        GH_TOKEN: ${{ inputs.token }}
+        REPO: ${{ github.repository }}
       run: |
         set -euo pipefail
         resolve() { git rev-parse --verify --quiet "$1^{commit}"; }
+
+        # For prt only. base.sha is the base branch *tip*, not the merge base, and prt
+        # reads the head lockfiles at HEAD_SHA, a real commit off the pull request's
+        # branch. Diffing that against the tip replays every base-branch commit made
+        # since the fork point, inverted: what the base branch dropped reads as
+        # something the pull request added, so a branch that is merely behind gets
+        # findings for packages it never touched.
+        #
+        # pr is the other shape and wants the tip. There the head lockfiles come from
+        # the workspace, which is GitHub's merge commit, already carrying the base
+        # branch through base.sha; the merge base would blame the pull request for the
+        # base branch's own changes.
+        #
+        # The compare API answers this without the head commit being in the checkout,
+        # which for a fork's head it never is: actions/checkout fetches refs/heads/*
+        # and refs/tags/* of the base repository only, so `git merge-base` would fail
+        # there. The merge base is an ancestor of base.sha, so it is still
+        # base-branch content and nothing of the pull request's is trusted.
+        merge_base() {
+          [ -n "${REPO:-}" ] || return 1
+          [[ "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]] || return 1
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || return 1
+          local sha
+          if ! sha=$(gh api "repos/$REPO/compare/$BASE_SHA...$HEAD_SHA" \
+                       --jq '.merge_base_commit.sha' 2>/dev/null); then
+            # Not fatal, the candidates below still gate. Say so anyway: falling back
+            # to the tip resurrects the over-reporting, which changes the digest, which
+            # drops a sign-off label that was correctly applied.
+            echo "::warning::Could not reach the compare API to resolve the merge base; falling back to the base branch tip, which over-reports on a branch that is behind." >&2
+            return 1
+          fi
+          # gh writes its error body to stdout, and --jq yields "null" for a missing
+          # field, so the answer is checked the same way the inputs are.
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || return 1
+          printf '%s\n' "$sha"
+        }
 
         # prt: the workflow comes from the base branch and the pull request's files are
         #      never checked out. This is the mode to run in.
@@ -104,14 +142,18 @@ runs:
         base=""
         case "$mode" in
           prt)
-            # Every candidate here is base-branch content. The last one is the tip of
-            # the base branch, which is what actions/checkout leaves in the tree under
-            # pull_request_target, so a default shallow checkout still works.
-            base=$(resolve "$BASE_SHA" || resolve "origin/$GITHUB_BASE_REF" || resolve HEAD || true)
+            # Every candidate here is base-branch content. The tip candidates behind
+            # the merge base keep a shallow checkout working, and are what
+            # actions/checkout leaves in the tree under pull_request_target; they
+            # over-report on a branch that is behind rather than failing the run.
+            mb=$(merge_base || true)
+            base=$(resolve "${mb:-}" || resolve "$BASE_SHA" || resolve "origin/$GITHUB_BASE_REF" || resolve HEAD || true)
             ;;
           pr)
             # Not HEAD here: under pull_request that is the merge commit, which
-            # contains the pull request's own changes.
+            # contains the pull request's own changes. The tip, not the merge base:
+            # the collect step reads this mode's head lockfiles out of that merge
+            # commit, so the base branch is already on both sides of the comparison.
             base=$(resolve "$BASE_SHA" || resolve "origin/$GITHUB_BASE_REF" || true)
             ;;
           *)
