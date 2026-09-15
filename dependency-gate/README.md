@@ -57,8 +57,10 @@ jobs:
           lockfiles: bun.lock ui/bun.lock
 ```
 
-`fetch-depth: 0` is required: the action compares against the base commit, which a
-shallow clone does not contain.
+`fetch-depth: 0` is required: the action compares against the **merge base** of the
+pull request and its target branch, which a shallow clone does not contain. The merge
+base, not the target branch's tip, is what keeps a branch that has fallen behind from
+being blamed for dependency changes that landed on the target branch after it forked.
 
 In this mode the action emits a `::warning::` on every run, because the workflow it is
 running from is the pull request's own copy. That is not paranoia, it is the residual
