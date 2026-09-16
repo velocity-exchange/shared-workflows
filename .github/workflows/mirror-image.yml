@@ -88,10 +88,16 @@ jobs:
                   ISSUER: ${{ inputs.source_verify_issuer }}
               run: |
                   set -euo pipefail
-                  if [ -z "$IDENTITY" ] || [ -z "$ISSUER" ]; then
+                  if [ -z "$IDENTITY" ] && [ -z "$ISSUER" ]; then
                     echo "::warning::Upstream signature NOT verified for ${SOURCE} — source_verify_identity/issuer unset (upstream doesn't sign releases yet). The digest itself is still the reviewed pin."
                     echo "⚠ Mirrored WITHOUT upstream signature verification: \`${SOURCE}\`" >> "$GITHUB_STEP_SUMMARY"
                     exit 0
+                  fi
+                  # Half-configured is a caller mistake, not an unsigned
+                  # upstream — fail closed rather than skipping silently.
+                  if [ -z "$IDENTITY" ] || [ -z "$ISSUER" ]; then
+                    echo "::error::source_verify_identity and source_verify_issuer must be set together (got identity='${IDENTITY}', issuer='${ISSUER}')."
+                    exit 1
                   fi
                   cosign verify \
                     --certificate-identity-regexp "$IDENTITY" \
@@ -175,4 +181,9 @@ jobs:
 
             - name: Sign image (prod)
               if: vars.VELOCITY_PROD_ECR_PUBLISH_ROLE != ''
-              run: cosign sign --yes "${{ steps.login-ecr-prod.outputs.registry }}/mirror/${{ inputs.name }}@${{ steps.mirror.outputs.digest }}"
+              env:
+                  REF: ${{ steps.login-ecr-prod.outputs.registry }}/mirror/${{ inputs.name }}
+                  DIGEST: ${{ steps.mirror.outputs.digest }}
+              run: |
+                  set -euo pipefail
+                  cosign sign --yes "${REF}@${DIGEST}"
