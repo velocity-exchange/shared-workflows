@@ -1,0 +1,178 @@
+# The central third-party image MIRROR — a SEPARATE signing identity from
+# publish-image.yml, on purpose. Callers use
+#   uses: velocity-exchange/shared-workflows/.github/workflows/mirror-image.yml@master
+# so the cosign keyless certificate's job_workflow_ref is THIS FILE AT
+# refs/heads/master, and the mirror ClusterImagePolicy (infrastructure-v3,
+# gitops/<env>/platform/policy-controller/) pins to exactly that. MOVING OR
+# RENAMING THIS FILE CHANGES THE IDENTITY — same migration rules as
+# publish-image.yml's header.
+#
+# Why a separate identity: publish-image.yml's signature means "built from
+# reviewed source in a velocity repo". A mirror signature can only ever mean
+# "we reviewed and chose this upstream digest" — weaker, so it must not be
+# interchangeable. The split is enforced two ways:
+#   - this workflow signs with a different identity, accepted ONLY by the
+#     mirror ClusterImagePolicy, whose image glob is <registry>/mirror/*;
+#   - the mirror/ ECR path prefix is FORCED here (not caller input), so this
+#     identity physically never signs a ref that the app-image policy globs
+#     match, and a compromised mirror flow cannot impersonate a built image.
+# The inverse also holds: publish-image.yml never signs third-party bytes.
+#
+# Same invariants as publish-image.yml: master-ancestry gate, cosign v2 pin,
+# digest-end-to-end (the digest is the caller's reviewed pin; every copy is
+# asserted against it).
+name: Mirror image (reusable)
+
+on:
+    workflow_call:
+        inputs:
+            name:
+                description: Image name; lands at mirror/<name> in both ECRs
+                required: true
+                type: string
+            image_tag:
+                description: ECR tag to publish, e.g. v1.2.3
+                required: true
+                type: string
+            source_image:
+                description: Digest-pinned upstream ref (…:tag@sha256:…) to mirror
+                required: true
+                type: string
+            # Future hook — set both once the upstream signs their releases:
+            # the mirror then cosign-verifies the upstream signature before
+            # copying and fails closed on mismatch. Empty = verification
+            # skipped with a warning in the run summary (upstream unsigned).
+            source_verify_identity:
+                description: cosign certificate identity regexp for the upstream signature
+                required: false
+                type: string
+                default: ''
+            source_verify_issuer:
+                description: cosign certificate OIDC issuer for the upstream signature
+                required: false
+                type: string
+                default: ''
+
+jobs:
+    mirror:
+        runs-on: ubicloud
+        steps:
+            # Mirror tags must point at reviewed code: the digest being
+            # mirrored is pinned in a file on the CALLER repo's master, so
+            # the tagged commit must be on master. Runs here — not in the
+            # caller — so it can't be stripped by editing a branch's
+            # workflow file.
+            - name: Require tagged commit to be on master
+              env:
+                  GH_TOKEN: ${{ github.token }}
+              run: |
+                  set -euo pipefail
+                  status=$(curl -sf -H "Authorization: Bearer ${GH_TOKEN}" \
+                    -H "Accept: application/vnd.github+json" \
+                    "https://api.github.com/repos/${GITHUB_REPOSITORY}/compare/master...${GITHUB_SHA}" | jq -r '.status')
+                  if [ "$status" != "identical" ] && [ "$status" != "behind" ]; then
+                    echo "::error::${GITHUB_REF_NAME} points at ${GITHUB_SHA}, which is not on master (compare status: ${status}). Mirror tags must point at reviewed master commits."
+                    exit 1
+                  fi
+
+            - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+              with:
+                  cosign-release: 'v2.6.5'
+
+            - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+
+            - name: Verify upstream signature
+              env:
+                  SOURCE: ${{ inputs.source_image }}
+                  IDENTITY: ${{ inputs.source_verify_identity }}
+                  ISSUER: ${{ inputs.source_verify_issuer }}
+              run: |
+                  set -euo pipefail
+                  if [ -z "$IDENTITY" ] || [ -z "$ISSUER" ]; then
+                    echo "::warning::Upstream signature NOT verified for ${SOURCE} — source_verify_identity/issuer unset (upstream doesn't sign releases yet). The digest itself is still the reviewed pin."
+                    echo "⚠ Mirrored WITHOUT upstream signature verification: \`${SOURCE}\`" >> "$GITHUB_STEP_SUMMARY"
+                    exit 0
+                  fi
+                  cosign verify \
+                    --certificate-identity-regexp "$IDENTITY" \
+                    --certificate-oidc-issuer "$ISSUER" \
+                    "$SOURCE"
+                  echo "Upstream signature verified: \`${SOURCE}\`" >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Configure AWS credentials (non-prod)
+              uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
+              with:
+                  role-to-assume: ${{ vars.VELOCITY_NON_PROD_ECR_PUBLISH_ROLE }}
+                  role-session-name: gha-${{ github.run_id }}
+                  aws-region: eu-west-1
+
+            - name: Log in to Amazon ECR (non-prod)
+              id: login-ecr
+              uses: aws-actions/amazon-ecr-login@19d944daaa35f0fa1d3f7f8af1d3f2e5de25c5b7 # v2.1.4
+
+            # crane copy is a pure registry-to-registry copy that cannot
+            # rewrite the manifest; the assertion turns any tool regression
+            # into a failed run instead of a silently different digest.
+            - name: Mirror image (non-prod, digest-preserving)
+              id: mirror
+              env:
+                  SOURCE: ${{ inputs.source_image }}
+                  DST: ${{ steps.login-ecr.outputs.registry }}/mirror/${{ inputs.name }}
+                  TAG: ${{ inputs.image_tag }}
+              run: |
+                  set -euo pipefail
+                  digest="${SOURCE##*@}"
+                  case "$digest" in
+                    sha256:*) ;;
+                    *) echo "::error::source_image must be pinned by digest (…@sha256:…): ${SOURCE}"; exit 1 ;;
+                  esac
+                  crane copy "${SOURCE}" "${DST}:${TAG}"
+                  copied=$(crane digest "${DST}:${TAG}")
+                  if [ "$copied" != "$digest" ]; then
+                    echo "::error::mirrored tag ${TAG} points at ${copied}, expected source digest ${digest} — copy did not preserve the digest."
+                    exit 1
+                  fi
+                  echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+            - name: Sign image (non-prod)
+              env:
+                  REF: ${{ steps.login-ecr.outputs.registry }}/mirror/${{ inputs.name }}
+                  TAG: ${{ inputs.image_tag }}
+                  DIGEST: ${{ steps.mirror.outputs.digest }}
+              run: |
+                  set -euo pipefail
+                  cosign sign --yes "${REF}@${DIGEST}"
+                  echo "Signed \`${TAG}\` — gitops pin: \`${REF}:${TAG}@${DIGEST}\`" >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Configure AWS credentials (prod)
+              if: vars.VELOCITY_PROD_ECR_PUBLISH_ROLE != ''
+              uses: aws-actions/configure-aws-credentials@ec61189d14ec14c8efccab744f656cffd0e33f37 # v6.1.0
+              with:
+                  role-to-assume: ${{ vars.VELOCITY_PROD_ECR_PUBLISH_ROLE }}
+                  role-session-name: gha-${{ github.run_id }}
+                  aws-region: eu-west-1
+
+            - name: Log in to Amazon ECR (prod)
+              if: vars.VELOCITY_PROD_ECR_PUBLISH_ROLE != ''
+              id: login-ecr-prod
+              uses: aws-actions/amazon-ecr-login@19d944daaa35f0fa1d3f7f8af1d3f2e5de25c5b7 # v2.1.4
+
+            - name: Mirror image (prod, digest-preserving)
+              if: vars.VELOCITY_PROD_ECR_PUBLISH_ROLE != ''
+              env:
+                  SOURCE: ${{ inputs.source_image }}
+                  DST: ${{ steps.login-ecr-prod.outputs.registry }}/mirror/${{ inputs.name }}
+                  TAG: ${{ inputs.image_tag }}
+                  DIGEST: ${{ steps.mirror.outputs.digest }}
+              run: |
+                  set -euo pipefail
+                  crane copy "${SOURCE}" "${DST}:${TAG}"
+                  copied=$(crane digest "${DST}:${TAG}")
+                  if [ "$copied" != "$DIGEST" ]; then
+                    echo "::error::prod tag ${TAG} points at ${copied}, expected ${DIGEST} — copy did not preserve the digest."
+                    exit 1
+                  fi
+
+            - name: Sign image (prod)
+              if: vars.VELOCITY_PROD_ECR_PUBLISH_ROLE != ''
+              run: cosign sign --yes "${{ steps.login-ecr-prod.outputs.registry }}/mirror/${{ inputs.name }}@${{ steps.mirror.outputs.digest }}"
