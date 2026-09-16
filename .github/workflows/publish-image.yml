@@ -59,6 +59,33 @@ on:
                 required: false
                 type: string
                 default: ''
+            # MIRROR MODE: set source_image (a full ref pinned by digest,
+            # e.g. ghcr.io/org/name:1.2.3@sha256:...) to SKIP the build and
+            # instead crane-copy that exact manifest into our ECR, then sign
+            # it under this workflow's identity like any built image. Trust
+            # model: the digest is reviewed in the caller repo (PR that bumps
+            # it) and the copy cannot rewrite the manifest, so what lands is
+            # bit-for-bit what was reviewed; our signature attests "we chose
+            # this digest", not that we built it.
+            source_image:
+                description: Digest-pinned upstream ref to mirror instead of building
+                required: false
+                type: string
+                default: ''
+            # Future hook — once the upstream signs their releases, set both
+            # and the mirror VERIFIES the upstream cosign signature before
+            # copying (fails closed on mismatch). Empty = verification
+            # skipped with a warning in the run summary (upstream unsigned).
+            source_verify_identity:
+                description: cosign certificate identity regexp for the upstream signature
+                required: false
+                type: string
+                default: ''
+            source_verify_issuer:
+                description: cosign certificate OIDC issuer for the upstream signature
+                required: false
+                type: string
+                default: ''
             checkout_submodules:
                 description: actions/checkout submodules value ('false', 'true' or 'recursive')
                 required: false
@@ -114,9 +141,13 @@ jobs:
               id: login-ecr
               uses: aws-actions/amazon-ecr-login@19d944daaa35f0fa1d3f7f8af1d3f2e5de25c5b7 # v2.1.4
 
+            - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
+
             - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+              if: inputs.source_image == ''
 
             - name: Build and push (non-prod)
+              if: inputs.source_image == ''
               id: build
               uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
               with:
@@ -130,11 +161,72 @@ jobs:
                   cache-to: ${{ inputs.cache_scope != '' && format('type=gha,mode=max,scope={0}', inputs.cache_scope) || '' }}
                   secrets: ${{ secrets.build_secrets }}
 
+            # Mirror mode: verify (when the upstream signs), then copy the
+            # exact reviewed digest. crane copy cannot rewrite the manifest,
+            # and the assertion catches any tool regression — same rationale
+            # as the prod copy below.
+            - name: Verify upstream signature (mirror)
+              if: inputs.source_image != ''
+              env:
+                  SOURCE: ${{ inputs.source_image }}
+                  IDENTITY: ${{ inputs.source_verify_identity }}
+                  ISSUER: ${{ inputs.source_verify_issuer }}
+              run: |
+                  set -euo pipefail
+                  if [ -z "$IDENTITY" ] || [ -z "$ISSUER" ]; then
+                    echo "::warning::Upstream signature NOT verified for ${SOURCE} — source_verify_identity/issuer unset (upstream doesn't sign releases yet). The digest itself is still the reviewed pin."
+                    echo "⚠ Mirrored WITHOUT upstream signature verification: \`${SOURCE}\`" >> "$GITHUB_STEP_SUMMARY"
+                    exit 0
+                  fi
+                  cosign verify \
+                    --certificate-identity-regexp "$IDENTITY" \
+                    --certificate-oidc-issuer "$ISSUER" \
+                    "$SOURCE"
+                  echo "Upstream signature verified: \`${SOURCE}\`" >> "$GITHUB_STEP_SUMMARY"
+
+            - name: Mirror image (non-prod, digest-preserving)
+              if: inputs.source_image != ''
+              id: mirror
+              env:
+                  SOURCE: ${{ inputs.source_image }}
+                  DST: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}
+                  TAG: ${{ inputs.image_tag }}
+              run: |
+                  set -euo pipefail
+                  digest="${SOURCE##*@}"
+                  case "$digest" in
+                    sha256:*) ;;
+                    *) echo "::error::source_image must be pinned by digest (…@sha256:…): ${SOURCE}"; exit 1 ;;
+                  esac
+                  crane copy "${SOURCE}" "${DST}:${TAG}"
+                  copied=$(crane digest "${DST}:${TAG}")
+                  if [ "$copied" != "$digest" ]; then
+                    echo "::error::mirrored tag ${TAG} points at ${copied}, expected source digest ${digest} — copy did not preserve the digest."
+                    exit 1
+                  fi
+                  echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+            # Single source of truth for the published digest: the build's in
+            # build mode, the upstream pin's in mirror mode. Every sign/copy
+            # step below uses this.
+            - name: Resolve published digest
+              id: digest
+              env:
+                  BUILD_DIGEST: ${{ steps.build.outputs.digest }}
+                  MIRROR_DIGEST: ${{ steps.mirror.outputs.digest }}
+              run: |
+                  set -euo pipefail
+                  digest="${BUILD_DIGEST:-$MIRROR_DIGEST}"
+                  if [ -z "$digest" ]; then
+                    echo "::error::no digest produced (neither build nor mirror ran)"; exit 1
+                  fi
+                  echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
             - name: Sign image (non-prod)
               env:
                   REF: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}
                   TAG: ${{ inputs.image_tag }}
-                  DIGEST: ${{ steps.build.outputs.digest }}
+                  DIGEST: ${{ steps.digest.outputs.digest }}
               run: |
                   set -euo pipefail
                   cosign sign --yes "${REF}@${DIGEST}"
@@ -153,9 +245,6 @@ jobs:
               id: login-ecr-prod
               uses: aws-actions/amazon-ecr-login@19d944daaa35f0fa1d3f7f8af1d3f2e5de25c5b7 # v2.1.4
 
-            - uses: imjasonh/setup-crane@feee3b6bb0d4c68370f256a4502498c9227e5c6b # v0.7
-              if: vars.VELOCITY_PROD_ECR_PUBLISH_ROLE != ''
-
             # Copy BY THE BUILT DIGEST with crane — a pure registry-to-registry
             # copy that CANNOT rewrite the manifest, so the prod tag points at
             # exactly the (signed) manifest this run built. `imagetools create`
@@ -170,7 +259,7 @@ jobs:
                   SRC: ${{ steps.login-ecr.outputs.registry }}/${{ inputs.ecr_repository }}
                   DST: ${{ steps.login-ecr-prod.outputs.registry }}/${{ inputs.ecr_repository }}
                   TAG: ${{ inputs.image_tag }}
-                  DIGEST: ${{ steps.build.outputs.digest }}
+                  DIGEST: ${{ steps.digest.outputs.digest }}
               run: |
                   set -euo pipefail
                   crane copy "${SRC}@${DIGEST}" "${DST}:${TAG}"
@@ -182,4 +271,4 @@ jobs:
 
             - name: Sign image (prod)
               if: vars.VELOCITY_PROD_ECR_PUBLISH_ROLE != ''
-              run: cosign sign --yes "${{ steps.login-ecr-prod.outputs.registry }}/${{ inputs.ecr_repository }}@${{ steps.build.outputs.digest }}"
+              run: cosign sign --yes "${{ steps.login-ecr-prod.outputs.registry }}/${{ inputs.ecr_repository }}@${{ steps.digest.outputs.digest }}"
